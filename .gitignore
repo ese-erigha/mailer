@@ -1,0 +1,12 @@
+node_modules
+dist
+dist-ssr
+.turbo
+*.tsbuildinfo
+coverage
+*.local
+.env
+.env.*
+!.env.example
+.DS_Store
+.vite

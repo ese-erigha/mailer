@@ -1,0 +1,26 @@
+---
+description: When to update mailer.mdc versus the docs — durable policy only, not every feature change
+alwaysApply: true
+---
+
+# When to update mailer.mdc
+
+`.cursor/rules/mailer.mdc` is standing orders. `docs/architecture.md` and `docs/prd.md` are the map. Update the rule only for durable policy. Do not refresh it on every code change.
+
+## Update `mailer.mdc` in the same change when
+
+- You add or remove an app or shared package (one line only)
+- You change how migrations, deploys, secrets, or required env work
+- You add a convention every agent task must follow
+- The same agent mistake happens more than once and the rule does not cover it
+
+Keep the change small. Do not paste the route list, the D1 columns, or a directory tree into the rule.
+
+## Do not update `mailer.mdc` when
+
+- You add a use case, a SQL file, a Drizzle column, or a repository method
+- The detail already belongs in `docs/architecture.md` or `docs/prd.md`
+
+## Also update the map
+
+When you add or remove an app, package, or data store, update [docs/architecture.md](docs/architecture.md). That file owns the tree. The rule points at it.

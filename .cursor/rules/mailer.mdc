@@ -1,0 +1,103 @@
+---
+description: Mailer monorepo — pnpm/turbo, D1 SQL, REST, Hono, Gmail allowlist, KISS and DRY, env and deploy policy
+alwaysApply: true
+---
+
+# Mailer (monorepo)
+
+A headless Gmail worker. One pnpm workspace. Turborepo runs the apps. The user reads and sends mail in Gmail.
+
+**Runtimes**
+
+- `apps/web` — React + Vite. Screens are fixtures until a screen calls the gateway.
+- `apps/gateway` — Hono. Local dev uses `@hono/node-server`. `cloudflare.config.ts` is the Worker config.
+- `apps/pipeline` — private Worker. Queue, mailbox Durable Object, Workflow, and cron.
+- `apps/evals` — golden threads. Not deployed.
+
+**Docs**
+
+- [docs/architecture.md](docs/architecture.md) — system map. Do not copy that tree into this file.
+- [docs/prd.md](docs/prd.md) — behavior, screens, and policies.
+
+## Tooling
+
+- **pnpm** + **Turborepo**. Never npm or yarn.
+- The CLI for Workers is **cf**. Do not add `wrangler.toml`, `wrangler.json`, or `wrangler.jsonc`.
+- `turbo run test` and `turbo run typecheck` depend on `^build`, so a shared package is built before an app imports `dist`.
+
+## SQL
+
+D1 is the database. SQL files live in `infra/migrations`. Drizzle tables live in `packages/db`. Write both by hand so they match.
+
+**Forbidden unless the user explicitly asks in that message:**
+
+- A remote D1 migration or `d1 execute` against production
+- `drizzle-kit push`
+- Shipping app code that reads a column before the SQL file is in git
+
+## Gateway
+
+One controller per route group. The controller parses with Zod, calls one use case, and returns JSON. The controller does not touch D1.
+
+A use case has no Hono types. It calls a repository or the Gmail client.
+
+Name a repository for the table. A method names one action. Reads use **Get** (primary key), **Find** (one row by something else), and **List**. Do not add `update(row)` that takes a whole bag of fields.
+
+## REST
+
+A route is a plural noun. The HTTP method is the action.
+
+- `GET` reads a collection or one item. The id is a path parameter.
+- `POST` creates a resource. An action that is not create, update, or delete is a noun sub-path.
+- `PATCH` changes part of one resource. `DELETE` removes it.
+- `200` for a read, `201` for a create, `400` for validation, `404` for a missing resource, `401` for a bad push token, `500` for an unexpected failure.
+- JSON fields are camelCase. The email triage object uses the field names in the PRD. Errors use one envelope.
+
+```typescript
+// ❌ BAD
+app.get('/api/getMailbox', ...)
+
+// ✅ GOOD
+app.get('/health', ...)
+app.post('/v1/gmail/push', ...)
+```
+
+## Gmail and tokens
+
+`packages/gmail` is the only module that names a Gmail method. The allowlist is `GMAIL_METHOD`. Send and permanent delete stay out of that object.
+
+`packages/domain` owns the category, the label, the queue payload, and the email triage schema. Its package name is `mailer-domain`. Do not name it `domain`. Node owns that module name. Do not copy those sets into an app.
+
+The refresh token in D1 is ciphertext. The key stays in a Worker secret. Logs omit tokens, authorization headers, and raw mail bodies.
+
+## Conventions
+
+- **KISS** — write the smallest code that does the requested behavior. Keep a single call site inline. Extract a helper when a second caller needs that same behavior.
+- **DRY** — one Zod schema and one `as const` object per fact.
+- **Clean code** — a function does one job. A controller parses and returns JSON. A use case decides. A repository queries. Delete unused code, including a commented-out alternative.
+- **No raw string literals for a closed set.** Define an `as const` object, derive the type with `(typeof OBJ)[keyof typeof OBJ]`, and use the members in comparisons and Zod.
+- **Names state the action.** Do not name a function `process` or `handle` when the action has a specific name.
+- **Call inputs** — pass data. The callee calls `fetch`, D1, or a repository. Do not pass a function so the callee can perform the write. `handleErrors` may take a function. That wrapper's job is to run it.
+- **Straight-line calls** — one `await` per statement. Name the result, then pass that name.
+- **`apps/web`** — A screen in `src/screens` composes the page. Route paths live in one `as const` object. A fixture screen does not call the gateway or Google.
+- **Product thresholds** such as `CLASSIFY_MIN_CONFIDENCE` live in `packages/domain`. Do not hardcode a second copy.
+- **Env** — required secrets are validated at the boundary. No silent fallback for `GOOGLE_CLIENT_SECRET` or `TOKEN_ENCRYPTION_KEY`. Do not commit secrets.
+
+```typescript
+// ❌ BAD
+if (category === 'inquiry') { ... }
+const event = await parseMailboxEvent(await request.json())
+
+// ✅ GOOD
+if (category === CATEGORY.inquiry) { ... }
+const body = await request.json()
+const event = await parseMailboxEvent(body)
+```
+
+## Repo policy
+
+- **Do not commit or push** unless the user asks in that message.
+- **Do not deploy.** The user deploys. Forbidden unless they ask: `cf deploy`, `wrangler deploy`, `git push`.
+- **Do not mutate remote Cloudflare data.** Forbidden unless they ask: remote D1 writes, KV writes, R2 writes, and secret puts.
+- Remote read-only checks are fine when the answer needs them. Prefer the code and the docs first.
+- OK without asking: `pnpm dev`, `pnpm build`, `pnpm test`, `pnpm typecheck`, `pnpm lint`.

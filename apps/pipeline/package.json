@@ -1,0 +1,22 @@
+{
+  "name": "pipeline",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsc -p tsconfig.build.json --watch --preserveWatchOutput",
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "oxlint",
+    "typecheck": "tsc -p tsconfig.json --noEmit --pretty false",
+    "test": "node --test $(find src -name '*.test.ts')"
+  },
+  "dependencies": {
+    "mailer-domain": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "cf": "1.0.0-beta.30",
+    "oxlint": "^1.88.0",
+    "typescript": "~6.0.3"
+  }
+}
