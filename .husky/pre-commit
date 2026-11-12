@@ -1,0 +1,5 @@
+set -e
+
+MAILER_SYNC_MIGRATIONS_STAGE=1 pnpm db:sync
+pnpm lint
+pnpm typecheck

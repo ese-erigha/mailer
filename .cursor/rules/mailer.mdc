@@ -9,7 +9,7 @@ A headless Gmail worker. One pnpm workspace. Turborepo runs the apps. The user r
 
 **Runtimes**
 
-- `apps/web` — React + Vite. Screens are fixtures until a screen calls the gateway.
+- `apps/web` — React + Vite, deployed as its own Worker with static assets. Its entry only forwards `/v1/*` to the gateway through a service binding. It holds no API code. Screens are fixtures until a screen calls the gateway.
 - `apps/gateway` — Hono. Local dev uses `@hono/node-server`. `cloudflare.config.ts` is the Worker config.
 - `apps/pipeline` — private Worker. Queue, mailbox Durable Object, Workflow, and cron.
 - `apps/evals` — golden threads. Not deployed.
@@ -18,22 +18,40 @@ A headless Gmail worker. One pnpm workspace. Turborepo runs the apps. The user r
 
 - [docs/architecture.md](docs/architecture.md) — system map. Do not copy that tree into this file.
 - [docs/prd.md](docs/prd.md) — behavior, screens, and policies.
+- [docs/delivery.md](docs/delivery.md) — release scope, build order, and release check of each phase.
 
 ## Tooling
 
 - **pnpm** + **Turborepo**. Never npm or yarn.
-- The CLI for Workers is **cf**. Do not add `wrangler.toml`, `wrangler.json`, or `wrangler.jsonc`.
+- The pre-commit hook runs `pnpm db:sync`, `pnpm lint`, and `pnpm typecheck`.
+- The CLI for Workers is **cf**. Do not add Wrangler, `wrangler.toml`, `wrangler.json`, or `wrangler.jsonc`. Set a Worker secret with `cf workers secrets update`.
+- Follow the current Cloudflare guidance: use Workers with static assets, not Pages.
+- Each Worker builds with the Cloudflare Vite plugin. Staging is the only environment. Name each resource `mailer-staging-<role>`, as Jobber does with `jobber-staging-db`. Do not put `staging` last.
 - `turbo run test` and `turbo run typecheck` depend on `^build`, so a shared package is built before an app imports `dist`.
 
-## SQL
+## SQL migration workflow
 
-D1 is the database. SQL files live in `infra/migrations`. Drizzle tables live in `packages/db`. Write both by hand so they match.
+Do not apply a migration locally. CI applies the remote DDL after a push to `develop`.
+
+1. Add the SQL file under `infra/migrations`. Then run `pnpm db:sync`. That runs `drizzle-kit generate --custom` for every SQL file the journal does not list, and it keeps the SQL you wrote. The pre-commit hook runs the same command. Do not ask the user to run it.
+2. CI runs `cf d1 migrations apply` from `apps/gateway` against `mailer-staging-db`. See [deploy-staging.yml](.github/workflows/deploy-staging.yml).
+3. Update the Drizzle tables in `packages/db/src/schema` by hand so they match that SQL, column for column.
+4. Application code that reads or writes a new column comes after that SQL file is in git and CI has applied it on staging.
 
 **Forbidden unless the user explicitly asks in that message:**
 
-- A remote D1 migration or `d1 execute` against production
-- `drizzle-kit push`
-- Shipping app code that reads a column before the SQL file is in git
+- `cf d1 migrations apply`, or `d1 execute` against any database
+- `drizzle-kit generate` without `--custom`. That command writes SQL from the TypeScript schema.
+- `drizzle-kit push` and `drizzle-kit migrate`
+- App code that reads a column before the matching SQL is in git and CI has applied it
+
+## Shared database
+
+`packages/db` holds the Drizzle tables and the repositories. Maintain the schema by hand so it matches the CI-applied SQL.
+
+Timestamps are integers in epoch milliseconds. The SQL sets no default. The caller sets `created_at` and `updated_at`. Do not store those times as text.
+
+Do not use `ALTER COLUMN … SET DEFAULT (strftime(…))`. D1 returns error 7500 for a non-constant default. Add a default on an existing table by recreating the table.
 
 ## Gateway
 
@@ -68,7 +86,7 @@ app.post('/v1/gmail/push', ...)
 
 `packages/domain` owns the category, the label, the queue payload, and the email triage schema. Its package name is `mailer-domain`. Do not name it `domain`. Node owns that module name. Do not copy those sets into an app.
 
-The refresh token in D1 is ciphertext. The key stays in a Worker secret. Logs omit tokens, authorization headers, and raw mail bodies.
+The refresh token in D1 is the `encrypted_refresh_token` column. The key stays in a Worker secret. Logs omit tokens, authorization headers, and raw mail bodies.
 
 ## Conventions
 
@@ -97,7 +115,8 @@ const event = await parseMailboxEvent(body)
 ## Repo policy
 
 - **Do not commit or push** unless the user asks in that message.
-- **Do not deploy.** The user deploys. Forbidden unless they ask: `cf deploy`, `wrangler deploy`, `git push`.
+- **Do not deploy.** `deploy-staging.yml` deploys on each push to `develop`. Forbidden unless they ask: `cf deploy` without `--dry-run`, `wrangler deploy`, `git push`.
 - **Do not mutate remote Cloudflare data.** Forbidden unless they ask: remote D1 writes, KV writes, R2 writes, and secret puts.
+- **No local infrastructure.** Every test of D1, KV, a queue, R2, or Gmail runs on staging. Do not run `cf dev` or a `--local` command.
 - Remote read-only checks are fine when the answer needs them. Prefer the code and the docs first.
-- OK without asking: `pnpm dev`, `pnpm build`, `pnpm test`, `pnpm typecheck`, `pnpm lint`.
+- OK without asking: `pnpm build`, `pnpm test`, `pnpm typecheck`, `pnpm lint`, and `cf deploy --dry-run`. A dry run sends no API request.

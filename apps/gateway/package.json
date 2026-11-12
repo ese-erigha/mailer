@@ -15,9 +15,11 @@
     "hono": "^4.13.14"
   },
   "devDependencies": {
+    "@cloudflare/vite-plugin": "2.0.0-beta.v.15",
     "@types/node": "^24.19.2",
     "cf": "1.0.0-beta.30",
     "oxlint": "^1.88.0",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "vite": "^8.3.8"
   }
 }

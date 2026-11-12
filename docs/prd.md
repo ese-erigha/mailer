@@ -310,7 +310,7 @@ The draft prompt receives the subject, the sender, the plain-text body, and the 
 - **Mailbox.** Watch expiration, Gmail history cursor, label ids, draft flag, and archive flag.
 - **Activity.** Gmail message id, thread id, subject, category, confidence, action, model id, token counts, and latency. The category is empty when the model output did not parse.
 - **Policy (Phase 2).** Title, file key, and vectors tagged with the account id.
-- **Access token.** KV only, with a TTL shorter than the Google expiry. D1 stores the refresh token ciphertext.
+- **Access token.** KV only, with a TTL shorter than the Google expiry. D1 stores the refresh token in `encrypted_refresh_token`.
 
 The Workflow may hold the body in the step input while the job runs. The finished job leaves the body out of D1 and R2.
 
@@ -339,7 +339,7 @@ These are targets. Measure them in Phase 3. Do not treat them as a current bench
 - **Draft time.** One draft workflow finishes within 60 seconds when Gmail, retrieval, and the model respond.
 - **Order.** One mailbox never runs two history syncs at the same time.
 - **Isolation.** A job carries the account id from D1. Mail text stays data for the prompt.
-- **Secrets.** The refresh token in D1 is AES-256-GCM ciphertext. The key lives in a Worker secret. Logs omit tokens, authorization headers, and raw mail bodies.
+- **Secrets.** The refresh token in D1 is AES-256-GCM in `encrypted_refresh_token`. The key lives in a Worker secret. Logs omit tokens, authorization headers, and raw mail bodies.
 - **Model logs.** AI Gateway keeps request and response logging off, because a prompt holds the mail body. The gateway still records the model id and the token counts.
 - **Send guard.** `packages/gmail` has no send function. A unit test fails if a send path is added.
 - **Launch limit.** `gmail.modify` is a restricted Google scope. Until Google verifies the app, sign-in works for test users on the consent screen only.
@@ -364,10 +364,12 @@ mailer/
 ├── turbo.json                        # build, dev, test, lint, typecheck
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                    # turbo test, then evals in Phase 3
+│       └── deploy-staging.yml        # develop → staging, then evals in Phase 3
 ├── docs/
 │   ├── prd.md
-│   └── architecture.md
+│   ├── architecture.md
+│   ├── delivery.md                   # release scope of each phase
+│   └── phase-1-plan.md               # Phase 1 setup, schema, routes, checkpoints
 ├── apps/
 │   ├── web/                          # React connect UI
 │   │   └── package.json
@@ -392,11 +394,13 @@ mailer/
 
 ## 9. Stepwise Implementation Milestones
 
+Each phase is one release. [delivery.md](delivery.md) lists the user scenarios, the build order, and the release check for each phase.
+
 ### Phase 1: Connect and label
 
 - [x] Add the pnpm workspace, Turborepo, and the four packages.
 - [ ] Add the D1 schema and the first migration.
-- [ ] Implement encrypt and decrypt for the refresh token. Bind the ciphertext to the account id.
+- [ ] Implement encrypt and decrypt for the refresh token. Bind `encrypted_refresh_token` to the account id.
 - [ ] Implement the Gmail client for watch, stop, profile get, history, message get, label create, and thread modify.
 - [ ] Serve the connect flow from `apps/gateway` with the built `apps/web` assets.
 - [ ] On callback, store the token, create the five Phase 1 labels, call `users.watch`, and save the history cursor.

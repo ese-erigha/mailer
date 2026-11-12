@@ -1,0 +1,258 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+    inputs:
+      apply_migrations:
+        description: "Apply database migrations?"
+        required: true
+        type: boolean
+        default: true
+      force_deploy:
+        description: "Deploy the gateway Worker even when gateway files did not change?"
+        required: false
+        type: boolean
+        default: false
+      force_deploy_pipeline:
+        description: "Deploy the pipeline Worker even when pipeline files did not change?"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  D1_DATABASE: mailer-staging-db
+  CF_SEND_TELEMETRY: "false"
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    name: Detect changes
+    outputs:
+      migrations: ${{ steps.changes.outputs.migrations }}
+      gateway: ${{ steps.changes.outputs.gateway }}
+      pipeline: ${{ steps.changes.outputs.pipeline }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "migrations=${{ inputs.apply_migrations }}" >> $GITHUB_OUTPUT
+            if [ "${{ inputs.force_deploy }}" == "true" ]; then
+              echo "gateway=true" >> $GITHUB_OUTPUT
+            else
+              echo "gateway=false" >> $GITHUB_OUTPUT
+            fi
+            if [ "${{ inputs.force_deploy_pipeline }}" == "true" ]; then
+              echo "pipeline=true" >> $GITHUB_OUTPUT
+            else
+              echo "pipeline=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+
+          if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+            echo "migrations=true" >> $GITHUB_OUTPUT
+            echo "gateway=true" >> $GITHUB_OUTPUT
+            echo "pipeline=true" >> $GITHUB_OUTPUT
+            echo "First push to branch — will run applicable jobs"
+            exit 0
+          fi
+
+          if git diff --name-only ${{ github.event.before }}..${{ github.sha }} | grep -E '^infra/migrations/.*\.sql$'; then
+            echo "migrations=true" >> $GITHUB_OUTPUT
+            echo "Migration files changed — will run migrations"
+          else
+            echo "migrations=false" >> $GITHUB_OUTPUT
+            echo "No migration files changed — skipping migrations"
+          fi
+
+          if git diff --name-only ${{ github.event.before }}..${{ github.sha }} | grep -E '^(apps/gateway/|apps/web/|packages/|pnpm-lock\.yaml|\.github/workflows/deploy-staging\.yml)'; then
+            echo "gateway=true" >> $GITHUB_OUTPUT
+          else
+            echo "gateway=false" >> $GITHUB_OUTPUT
+          fi
+
+          if git diff --name-only ${{ github.event.before }}..${{ github.sha }} | grep -E '^(apps/pipeline/|packages/|pnpm-lock\.yaml|\.github/workflows/deploy-staging\.yml)'; then
+            echo "pipeline=true" >> $GITHUB_OUTPUT
+          else
+            echo "pipeline=false" >> $GITHUB_OUTPUT
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    name: Lint, typecheck, test, and build
+    needs: [detect-changes]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run lint typecheck test build
+
+  migrate:
+    runs-on: ubuntu-latest
+    name: Apply database migrations
+    needs: [test, detect-changes]
+    if: needs.detect-changes.outputs.migrations == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Use handwritten migrations
+        run: |
+          echo "Using hand-written SQL from infra/migrations/"
+          echo "Skipping Drizzle generation — curated manual migrations only"
+
+      - name: Ensure the D1 database exists
+        id: database
+        working-directory: apps/gateway
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          database_id=$(pnpm exec cf d1 list --name "$D1_DATABASE" \
+            | jq -r --arg name "$D1_DATABASE" '.[] | select(.name == $name) | .uuid')
+          if [ -n "$database_id" ]; then
+            echo "D1 database $D1_DATABASE already exists."
+          else
+            database_id=$(pnpm exec cf d1 create --name "$D1_DATABASE" | jq -r '.uuid')
+            echo "Created D1 database $D1_DATABASE."
+          fi
+          echo "id=$database_id" >> $GITHUB_OUTPUT
+
+      - name: Apply migrations
+        working-directory: apps/gateway
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec cf d1 migrations apply "${{ steps.database.outputs.id }}" --dir ../../infra/migrations
+
+  deploy-gateway:
+    runs-on: ubuntu-latest
+    name: Deploy gateway
+    needs: [detect-changes, test, migrate]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.gateway == 'true' &&
+      needs.test.result == 'success' &&
+      (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Deploy gateway to Cloudflare Workers
+        working-directory: apps/gateway
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec cf deploy --message "${{ github.sha }}"
+
+  deploy-pipeline:
+    runs-on: ubuntu-latest
+    name: Deploy pipeline
+    needs: [detect-changes, test, migrate]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.pipeline == 'true' &&
+      needs.test.result == 'success' &&
+      (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Deploy pipeline to Cloudflare Workers
+        working-directory: apps/pipeline
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec cf deploy --message "${{ github.sha }}"
+
+  summary:
+    runs-on: ubuntu-latest
+    name: Staging summary
+    needs: [test, detect-changes, migrate, deploy-gateway, deploy-pipeline]
+    if: always()
+    steps:
+      - name: Workflow summary
+        run: |
+          echo "## Staging summary"
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "- Checks: FAILED"
+            exit 1
+          fi
+          echo "- Checks: SUCCESS"
+          echo "- Migrations requested: ${{ needs.detect-changes.outputs.migrations }}"
+          echo "- Gateway changes: ${{ needs.detect-changes.outputs.gateway }}"
+          echo "- Pipeline changes: ${{ needs.detect-changes.outputs.pipeline }}"
+
+          if [ "${{ needs.detect-changes.outputs.migrations }}" == "true" ]; then
+            if [ "${{ needs.migrate.result }}" == "success" ]; then
+              echo "- Database migrations: SUCCESS"
+            elif [ "${{ needs.migrate.result }}" == "skipped" ]; then
+              echo "- Database migrations: SKIPPED"
+            else
+              echo "- Database migrations: FAILED"
+              exit 1
+            fi
+          else
+            echo "- Database migrations: SKIPPED (no SQL changes)"
+          fi
+
+          if [ "${{ needs.detect-changes.outputs.gateway }}" == "true" ]; then
+            if [ "${{ needs.deploy-gateway.result }}" == "success" ]; then
+              echo "- Gateway deploy: SUCCESS"
+            elif [ "${{ needs.deploy-gateway.result }}" == "skipped" ]; then
+              echo "- Gateway deploy: SKIPPED"
+            else
+              echo "- Gateway deploy: FAILED"
+              exit 1
+            fi
+          else
+            echo "- Gateway deploy: SKIPPED (no gateway changes)"
+          fi
+
+          if [ "${{ needs.detect-changes.outputs.pipeline }}" == "true" ]; then
+            if [ "${{ needs.deploy-pipeline.result }}" == "success" ]; then
+              echo "- Pipeline deploy: SUCCESS"
+            elif [ "${{ needs.deploy-pipeline.result }}" == "skipped" ]; then
+              echo "- Pipeline deploy: SKIPPED"
+            else
+              echo "- Pipeline deploy: FAILED"
+              exit 1
+            fi
+          else
+            echo "- Pipeline deploy: SKIPPED (no pipeline changes)"
+          fi

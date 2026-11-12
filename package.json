@@ -10,9 +10,14 @@
     "build": "turbo run build",
     "test": "turbo run test",
     "lint": "turbo run lint",
-    "typecheck": "turbo run typecheck"
+    "typecheck": "turbo run typecheck",
+    "db:new": "drizzle-kit generate --custom --name",
+    "db:sync": "node scripts/sync-migration-journal.mjs",
+    "prepare": "husky"
   },
   "devDependencies": {
+    "drizzle-kit": "^0.31.11",
+    "husky": "^9.1.7",
     "turbo": "^2.6.1"
   }
 }

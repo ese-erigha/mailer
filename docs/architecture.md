@@ -43,7 +43,7 @@ The schema language is Zod, in `packages/domain`. Workers run every request.
     └── [ Gmail API ]
 
 [ Google Cloud Pub/Sub ]
-  topic mailer-gmail
+  topic mailer-staging-gmail
   push subscription → POST /v1/gmail/push
     ▲
     │  users.watch
@@ -100,7 +100,7 @@ The object can take a second request while it waits on a Gmail `fetch`. Storage 
 
 History sync steps, in order:
 
-1. Read `mailboxes.history_id` from D1. When the row is missing, stop. The mailbox is gone or not ready.
+1. Read `mailboxes.gmail_history_id` from D1. When the row is missing, stop. The mailbox is gone or not ready.
 2. Call `history.list` with `startHistoryId`, `historyTypes=messageAdded`, and `labelId=INBOX`. Follow each page.
 3. Drop each message that has the `SENT` or the `DRAFT` label. That removes the user's own mail and every Mailer draft.
 4. Start one `MailTriage` per remaining message. A duplicate instance id fails on create. Treat that error as done.
@@ -131,7 +131,7 @@ The Workflow calls the model. The Durable Object stays on history sync.
 
 ### Tier 4: Gmail and Pub/Sub
 
-One Google Cloud project holds the OAuth client and the topic `mailer-gmail`.
+One Google Cloud project holds the OAuth client and the topic `mailer-staging-gmail`. The Worker var `PUBSUB_TOPIC` names the topic.
 
 Grant `gmail-api-push@system.gserviceaccount.com` the Pub/Sub Publisher role on that topic. Point the push subscription at `https://<gateway-host>/v1/gmail/push` with an OIDC token. The gateway checks the issuer, the audience, and the service account email.
 
@@ -139,7 +139,7 @@ Grant `gmail-api-push@system.gserviceaccount.com` the Pub/Sub Publisher role on 
 
 ```json
 {
-  "topicName": "projects/<gcp-project>/topics/mailer-gmail",
+  "topicName": "projects/<GCP_PROJECT_ID>/topics/<PUBSUB_TOPIC>",
   "labelIds": ["INBOX"],
   "labelFilterBehavior": "INCLUDE"
 }
@@ -153,24 +153,24 @@ The watch filter limits the pushes to the inbox. It does not filter `history.lis
 
 ### Tier 5: Data stores
 
-- **D1** holds accounts, sessions, ciphertext, mailbox cursors, activity, and policy metadata. Drizzle defines the schema in `packages/db`. SQL files live in `infra/migrations`.
+- **D1** holds accounts, sessions, the encrypted refresh token, mailbox cursors, activity, and policy metadata. Drizzle defines the schema in `packages/db`. SQL files live in `infra/migrations`.
 - **KV** holds the OAuth `state` value and the Gmail access token. The access token key is `access:<accountId>`. The TTL is shorter than `expires_in`.
 - **Vectorize** holds policy chunks in Phase 2. Each vector metadata includes `accountId` and `documentId`. The same embedding model writes the index and builds the query.
 - **R2** holds the original policy file in Phase 2. Mail bodies stay out of R2.
-- **Worker secret** `TOKEN_ENCRYPTION_KEY` is 32 bytes, base64. The cipher is AES-256-GCM from Web Crypto. The associated data is the account id. A copied blob fails decryption under another account id. The row stores the nonce, the ciphertext, and the key version.
+- **Worker secret** `TOKEN_ENCRYPTION_KEY` is 32 bytes, base64. The cipher is AES-256-GCM from Web Crypto. The associated data is the account id. A copied blob fails decryption under another account id. The row stores `encryption_nonce` and `encrypted_refresh_token`.
 
 D1 tables:
 
-- `accounts` — id, google subject, email, created time
-- `sessions` — id, account id, expiry
-- `oauth_tokens` — account id, ciphertext, nonce, key version
-- `mailboxes` — account id, history id, watch expiration, watch resource id, label id map, drafts flag, archive flag, status
-- `activities` — account id, Gmail message id, thread id, subject, category, confidence, action, model, token counts, latency, created time
+- `accounts` — id, google sub claim, Gmail address, created time
+- `sessions` — token hash, account id, expiry
+- `oauth_tokens` — account id, encrypted refresh token, encryption nonce, consent time
+- `mailboxes` — account id, Gmail history id, Gmail watch expiry, label id by name, status
+- `activities` — account id, Gmail message id, Gmail thread id, email subject, category, model confidence, Mailer action, model id, prompt tokens, completion tokens, triage duration, created time
 - `policies` — id, account id, title, R2 key, created time
 
-`activities` has a unique key on `(account_id, gmail_message_id)`. `category` is null when the model output did not parse. `action` is one of `ACTIVITY_ACTION` in `packages/domain`.
+`activities` has a unique key on `(account_id, gmail_message_id)`. `category` is null when the model output did not parse. `mailer_action` is one of `ACTIVITY_ACTION` in `packages/domain`.
 
-`mailboxes.history_id` is the only copy of the cursor. The gateway writes it once on connect. After that, only the mailbox Durable Object writes it. The Durable Object keeps no cursor in its own storage, so disconnect has one row to delete.
+`mailboxes.gmail_history_id` is the only copy of the cursor. The gateway writes it once on connect. After that, only the mailbox Durable Object writes it. The Durable Object keeps no cursor in its own storage, so disconnect has one row to delete.
 
 ### Tier 6: Models
 
@@ -204,7 +204,7 @@ Phase 2 uses the same gateway for the draft. Embeddings use a Workers AI embeddi
 
 ### Scenario B: A new inbox message arrives
 
-1. Gmail publishes to `mailer-gmail`.
+1. Gmail publishes to the topic of the environment.
 2. Pub/Sub calls `POST /v1/gmail/push` with a Google OIDC token.
 3. The gateway verifies the token, maps the address to an account, and enqueues `{ accountId }`.
 4. The gateway returns `204`.
@@ -282,40 +282,68 @@ Read the current Workflow limits before you set step timeouts. Confirm the allow
 
 ## 6. Deployment
 
-Local development uses `cf dev` on `apps/gateway` and `apps/pipeline`. Resource commands for D1, KV, R2, Queues, and Vectorize use `cf`. Look up the exact command with `cf cli search` at implementation time. Do not add a Wrangler config file.
+Every test runs on Cloudflare. Gmail push needs a public HTTPS URL, so the full flow cannot run on a laptop. Do not use `cf dev` or a `--local` command against D1, KV, a queue, or R2.
 
-Production has two Workers.
+### Staging
 
-- `mailer-gateway` serves assets and the public API.
+Mailer has one environment: staging. Each Cloudflare and Google resource name is `mailer-staging-<role>`. The environment sits in the middle. Jobber uses the same order, for example `jobber-staging-db`.
+
+- Workers `mailer-staging-gateway` and `mailer-staging-pipeline`
+- D1 database `mailer-staging-db`
+- Pub/Sub topic `mailer-staging-gmail`
+- A KV namespace, a queue, an R2 bucket, or a Vectorize index takes the form `mailer-staging-<role>`, such as `mailer-staging-events`.
+
+`cloudflare.config.ts` is the Worker config for `cf`. It replaces `wrangler.toml`. Each Worker builds with the Cloudflare Vite plugin. `cf` needs that build tool. It does not run the `build` script in `package.json`.
+
+Name each data store in `cloudflare.config.ts` when the code first binds it. `cf deploy` creates a missing KV namespace or queue from the name. The deploy workflow creates the D1 database, because the migrations run before the deploy.
+
+### Deploy workflow
+
+`.github/workflows/deploy-staging.yml` is the only workflow. It runs on each push to `develop`, and on a manual run. Its jobs follow the Nearcrawl layout:
+
+1. **Detect changes.** A SQL file under `infra/migrations` requests the migrations. A change under `packages/`, in the lockfile, or in the workflow deploys both Workers. A change under `apps/web` deploys the gateway, because the gateway serves the web assets.
+2. **Lint, typecheck, test, and build.**
+3. **Apply database migrations.** Find the D1 database `mailer-staging-db`, then run `cf d1 migrations apply` on Cloudflare.
+4. **Deploy gateway** and **Deploy pipeline.** Each job runs `cf deploy` for one changed Worker, after the migrations succeed or skip.
+5. **Staging summary.** Print the result of each job. Fail when a requested job failed.
+
+A manual run can force the migrations and the deploy of each Worker.
+
+Phase 3 adds an eval job to that workflow. The eval job calls the model, so it needs a model secret.
+
+### One-time setup
+
+Do these steps once. CI cannot do them.
+
+1. In GitHub, add the repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+   - Phase 1 needs these token permissions: Workers Scripts edit, D1 edit, Workers KV Storage edit, and Queues edit.
+   - Phase 2 adds R2 edit and Vectorize edit.
+2. Push to `develop`. The first deploy creates the two Workers.
+3. Set the Worker secrets on each Worker in the Cloudflare dashboard, or with `npx wrangler secret put <NAME> --name <WORKER_NAME>`. `cf` has no single-secret command yet.
+4. In Google Cloud, do the setup below.
+
+### Worker secrets and vars
+
+- `mailer-staging-gateway` serves the assets and the public API.
   - Bind D1, KV, and the queue producer.
-  - Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`, `PUBSUB_AUDIENCE`, `PUBSUB_SERVICE_ACCOUNT`, and `GCP_PROJECT_ID`.
-- `mailer-pipeline` has no public route. It runs the queue consumer, the Durable Object, the Workflow, and the cron.
+  - Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`, `PUBSUB_AUDIENCE`, `PUBSUB_SERVICE_ACCOUNT`, `GCP_PROJECT_ID`, and `PUBSUB_TOPIC`.
+- `mailer-staging-pipeline` has no public route. It runs the queue consumer, the Durable Object, the Workflow, and the cron.
   - Bind D1, KV, the queue consumer, Vectorize, R2, AI Gateway, and Workflows.
   - Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `TOKEN_ENCRYPTION_KEY`. A token refresh needs the client secret.
   - Set the AI Gateway identifier and the model ids.
 
 Use the same `TOKEN_ENCRYPTION_KEY` on both Workers. A token written by the gateway must decrypt on the pipeline.
 
-Set these secrets and vars. Do not commit them.
+`GOOGLE_CLIENT_ID`, `GCP_PROJECT_ID`, and `PUBSUB_TOPIC` may be vars. The rest are secrets. Do not commit them.
 
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
-- `TOKEN_ENCRYPTION_KEY`
-- `PUBSUB_AUDIENCE`
-- `PUBSUB_SERVICE_ACCOUNT`
-- `GCP_PROJECT_ID`
-- The AI Gateway identifier and the model ids
+### Google Cloud setup
 
-`GOOGLE_CLIENT_ID` may be a var. The rest are secrets.
+Google Cloud setup is manual for version 1.
 
-CI on a pull request runs `turbo run typecheck test`. Phase 3 adds `turbo run eval`. The eval job calls the model, so it needs a model secret in CI. A pull request from a fork gets no secret, so the eval job skips there. Deploy stays manual until a later workflow exists. Add that workflow after the first `cf deploy` is understood.
-
-Google Cloud setup is manual for version 1:
-
-1. Create an OAuth web client. Add the gateway callback URL.
+1. Create an OAuth web client. Add the callback URL of the gateway on its `workers.dev` host.
 2. Add the test users on the consent screen.
-3. Create the topic and the push subscription.
-4. Grant the Gmail push service account the publisher role.
+3. Create the topic `mailer-staging-gmail`. Give it one push subscription to `POST /v1/gmail/push` on the gateway.
+4. Grant the Gmail push service account the publisher role on that topic.
 
 The OAuth app stays in Google testing mode until Google finishes the restricted-scope review. In testing mode, a refresh token expires 7 days after consent. The next refresh fails with `invalid_grant`, and the mailbox moves to `disconnected`. For a Google Workspace account, an internal OAuth app avoids that expiry.
 
@@ -346,14 +374,16 @@ mailer/
 ├── turbo.json
 ├── .github/
 │   └── workflows/
-│       └── ci.yml
+│       └── deploy-staging.yml        # develop → staging: checks, migrations, deploys
 ├── docs/
 │   ├── prd.md
-│   └── architecture.md
+│   ├── architecture.md
+│   ├── delivery.md                   # release scope of each phase
+│   └── phase-1-plan.md               # Phase 1 setup, schema, routes, checkpoints
 ├── apps/
 │   ├── web/                          # React screens. Built into gateway assets.
-│   ├── gateway/                      # Public Worker. cloudflare.config.ts
-│   ├── pipeline/                     # Private Worker. cloudflare.config.ts
+│   ├── gateway/                      # Public Worker. cloudflare.config.ts, vite.config.ts
+│   ├── pipeline/                     # Private Worker. cloudflare.config.ts, vite.config.ts
 │   └── evals/                        # Golden set. Not deployed.
 ├── packages/
 │   ├── db/
@@ -374,7 +404,7 @@ pnpm test
 pnpm typecheck
 ```
 
-`pnpm dev` starts the web app and the two Workers through Turborepo. The gateway origin is the one to open in a browser. The pipeline has no page.
+`pnpm dev` starts the web screens and the gateway routes that use no binding. A flow that needs D1, KV, a queue, or Gmail runs on staging. Section 6 describes the deploy.
 
 ---
 
