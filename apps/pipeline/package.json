@@ -11,7 +11,12 @@
     "test": "node --test $(find src -name '*.test.ts')"
   },
   "dependencies": {
-    "mailer-domain": "workspace:*"
+    "db": "workspace:*",
+    "gmail": "workspace:*",
+    "log": "workspace:*",
+    "mailer-domain": "workspace:*",
+    "tokens": "workspace:*",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "2.0.0-beta.v.15",

@@ -12,7 +12,14 @@
   },
   "dependencies": {
     "@hono/node-server": "^2.1.5",
-    "hono": "^4.13.14"
+    "db": "workspace:*",
+    "gmail": "workspace:*",
+    "hono": "^4.13.14",
+    "jose": "^6.2.17",
+    "log": "workspace:*",
+    "mailer-domain": "workspace:*",
+    "tokens": "workspace:*",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "2.0.0-beta.v.15",

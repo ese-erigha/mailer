@@ -1,11 +1,11 @@
 ---
-description: Mailer monorepo — pnpm/turbo, D1 SQL, REST, Hono, Gmail allowlist, KISS and DRY, env and deploy policy
+description: Mailer monorepo — pnpm/turbo, D1 SQL, REST, Hono, Gmail allowlist, KISS and DRY, type placement, env and deploy policy
 alwaysApply: true
 ---
 
 # Mailer (monorepo)
 
-A headless Gmail worker. One pnpm workspace. Turborepo runs the apps. The user reads and sends mail in Gmail.
+An AI email client for one Gmail account. One pnpm workspace. Turborepo runs the apps. Phases 1 to 3 are a headless worker, and the user reads and sends mail in Gmail. From Phase 4, `apps/web` is the mail client.
 
 **Runtimes**
 
@@ -19,6 +19,7 @@ A headless Gmail worker. One pnpm workspace. Turborepo runs the apps. The user r
 - [docs/architecture.md](docs/architecture.md) — system map. Do not copy that tree into this file.
 - [docs/prd.md](docs/prd.md) — behavior, screens, and policies.
 - [docs/delivery.md](docs/delivery.md) — release scope, build order, and release check of each phase.
+- [docs/features.md](docs/features.md) — the feature list and its sources.
 
 ## Tooling
 
@@ -55,11 +56,35 @@ Do not use `ALTER COLUMN … SET DEFAULT (strftime(…))`. D1 returns error 7500
 
 ## Gateway
 
-One controller per route group. The controller parses with Zod, calls one use case, and returns JSON. The controller does not touch D1.
+`src/app.ts` mounts one controller per route group and holds no route logic.
 
-A use case has no Hono types. It calls a repository or the Gmail client.
+```text
+apps/gateway/src/domain/<group>/
+  <group>.controller.ts
+  <group>.schema.ts
+  usecases/<action>.usecase.ts
+```
 
-Name a repository for the table. A method names one action. Reads use **Get** (primary key), **Find** (one row by something else), and **List**. Do not add `update(row)` that takes a whole bag of fields.
+The controller registers the route and its handler in one file. It calls `parseRequest`, then one use case, and returns JSON or a redirect. The controller does not touch D1, KV, or Gmail.
+
+`parseRequest` throws `RequestError` for a bad request. Do not call `schema.parse` in a handler. `app.onError` calls `handleErrors`. A handler throws. It does not catch.
+
+`<group>.schema.ts` holds the HTTP request schema. The use case file holds that action's input type and its result type. A route group with no request body has no schema file. Do not add a types file for the group.
+
+A use case has no Hono types. It decides, then calls one repository or the Gmail client. A session read is a use case. The controller reads the cookie and passes the token. Name the file for the action, such as `read-mailbox.usecase.ts`.
+
+A repository is a class in `packages/db/src/repositories`, one class per table. The constructor receives the database. Do not export a function that returns an object of functions. A method names one action. Its input lists the columns that action writes. Reads use **Get** (primary key), **Find** (one row by something else), and **List**. Do not add `update(row)` that takes a whole bag of fields.
+
+## Pipeline
+
+`src/index.ts` only dispatches a queue batch or a cron to one named function. The entry does not contain the job.
+
+```text
+apps/pipeline/src/<job>/
+  <job>.ts
+```
+
+A job names its action, such as `sync-mailbox` or `triage-mail`. The job has no Hono types. It calls a repository in `packages/db` and a client in `packages/gmail`. An OpenRouter call lives in that job folder. Do not put it in `src/index.ts`.
 
 ## REST
 
@@ -82,7 +107,13 @@ app.post('/v1/gmail/push', ...)
 
 ## Gmail and tokens
 
-`packages/gmail` is the only module that names a Gmail method. The allowlist is `GMAIL_METHOD`. Send and permanent delete stay out of that object.
+`packages/gmail` is the only module that names a Gmail method. The allowlist is `GMAIL_METHOD`.
+
+- Permanent delete of a message or a thread stays out of that object in every phase.
+- Send stays out of that object until Phase 4 starts. Do not add a send method before that phase.
+- From Phase 4, `users.drafts.send` is the one send method. Only the gateway use case for the Send button calls it. No file in `apps/pipeline` imports it.
+
+From Phase 1, the mail store holds body text in R2. Encrypt each body with the data key of its account before the write. The data key stays wrapped under `MAIL_ENCRYPTION_KEY`. Do not write a plain mail body to D1, R2, KV, or vector metadata.
 
 `packages/domain` owns the category, the label, the queue payload, and the email triage schema. Its package name is `mailer-domain`. Do not name it `domain`. Node owns that module name. Do not copy those sets into an app.
 
@@ -90,26 +121,37 @@ The refresh token in D1 is the `encrypted_refresh_token` column. The key stays i
 
 ## Conventions
 
-- **KISS** — write the smallest code that does the requested behavior. Keep a single call site inline. Extract a helper when a second caller needs that same behavior.
+- **KISS** — write the smallest code that does the requested behavior. Keep a single call site inline. Extract a helper when a second caller needs that same behavior. A step of an action is the exception. Name that step even when it has one caller.
 - **DRY** — one Zod schema and one `as const` object per fact.
 - **Clean code** — a function does one job. A controller parses and returns JSON. A use case decides. A repository queries. Delete unused code, including a commented-out alternative.
+- **Steps** — the exported function calls one named function per job, in order. Each function stays in the same file and does one job. An expected failure returns the action's result. The caller returns that result and stops. Do not put the whole action in one function. Do not put each step in its own file.
 - **No raw string literals for a closed set.** Define an `as const` object, derive the type with `(typeof OBJ)[keyof typeof OBJ]`, and use the members in comparisons and Zod.
 - **Names state the action.** Do not name a function `process` or `handle` when the action has a specific name.
-- **Call inputs** — pass data. The callee calls `fetch`, D1, or a repository. Do not pass a function so the callee can perform the write. `handleErrors` may take a function. That wrapper's job is to run it.
+- **Call inputs** — pass data. The callee calls `fetch`, D1, or a repository. Do not pass a function into our functions. A repository object is data. Hono route registration, Workflow `step.do`, and `AsyncLocalStorage.run` are platform boundaries.
+- **Object parameters** — an object parameter has a named type. Do not write the fields inline in the parameter list.
+- **Payload** — build the object and name it before the call. When the parameter has a named type, use that type. Do not write the fields in the argument list. A Zod schema and a Worker config stay in place.
+- **Types** — a type stays in the file of the function that owns it. A shared Worker binding lives in one bindings file, such as `apps/pipeline/src/bindings.ts`. Do not collect unrelated types into a types file.
+- **Config** — the Worker entry stores the env with `AsyncLocalStorage.run`. Gateway functions call `getConfig()`. Pipeline functions call `getPipelineConfig()`. Do not pass `GatewayEnv` or `PipelineEnv` into a function. Workers do not support `enterWith`. Secrets stay on the Worker env. They are not in `cloudflare.config.ts`.
+- **Async** — write `async` functions and use `await`. Do not use `.then`, `.catch`, `new Promise`, or a callback parameter.
+- **Database** — a repository method runs one statement. Do not query the database inside a loop. Load the rows in one query, then work on that list.
 - **Straight-line calls** — one `await` per statement. Name the result, then pass that name.
 - **`apps/web`** — A screen in `src/screens` composes the page. Route paths live in one `as const` object. A fixture screen does not call the gateway or Google.
 - **Product thresholds** such as `CLASSIFY_MIN_CONFIDENCE` live in `packages/domain`. Do not hardcode a second copy.
+- **Log** — call `log` from the `log` package. It forwards the arguments to `console`. The `log` package is the only code that calls `console`.
 - **Env** — required secrets are validated at the boundary. No silent fallback for `GOOGLE_CLIENT_SECRET` or `TOKEN_ENCRYPTION_KEY`. Do not commit secrets.
 
 ```typescript
 // ❌ BAD
 if (category === 'inquiry') { ... }
 const event = await parseMailboxEvent(await request.json())
+await tokens.save({ accountId, createdAt: now, updatedAt: now })
 
 // ✅ GOOD
 if (category === CATEGORY.inquiry) { ... }
 const body = await request.json()
 const event = await parseMailboxEvent(body)
+const token: SaveOauthTokenInput = { accountId, createdAt: now, updatedAt: now }
+await tokens.save(token)
 ```
 
 ## Repo policy

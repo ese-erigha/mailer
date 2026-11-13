@@ -23,18 +23,21 @@ This plan turns Phase 1 of [delivery.md](delivery.md) into work that one impleme
 **In scope.** The stories in [delivery.md](delivery.md), Phase 1:
 
 - US-1.1 to US-1.7 — connect, error, return visit, disconnect, and revoked grant
-- US-2.1 to US-2.7 — push, start line, one-time handling, catch-up, order, sent mail and drafts, and the expired cursor
+- US-2.1 to US-2.8 — push, start line, one-time handling, catch-up, order, sent mail and drafts, the expired cursor, and the backfill of the last 30 days
 - US-3.1 to US-3.5 — the category, the label, Needs Review, High Priority, and Spam
 - US-6.4 — disconnect deletes the activity rows
+- US-8.6, US-8.7, and US-8.9 — the encrypted copy of each email that Mailer classifies
 
 **Out of scope.**
 
-- Policies, drafts, Vectorize, and R2 (Phase 2)
+- Policies, drafts, and Vectorize (Phase 2)
+- The removal of a stored message that the user deletes in Gmail. This sync is the first step of Phase 2.
+- The rest of the mail store (Phase 6): the vectors, sent mail, archived mail, and the 90-day import
 - The activity list screen and the settings screen (Phase 2). Phase 1 writes the activity rows, but no screen lists them.
 - Archive. Phase 1 never removes `INBOX`.
 - The eval gate (Phase 3)
 - A production environment. Staging is the only environment.
-- Rotation of the encryption key. Phase 1 uses one key, `TOKEN_ENCRYPTION_KEY`.
+- Rotation of an encryption key. Phase 1 uses one `TOKEN_ENCRYPTION_KEY` and one `MAIL_ENCRYPTION_KEY`.
 
 ---
 
@@ -45,35 +48,48 @@ This section is the map for an implementer. It lists every table, every endpoint
 ### 2.1 The 3 Workers
 
 - `mailer-staging-web` (`apps/web`) — serves the screens. Forwards `/v1/*` to the gateway. No API code, no data, no secret.
-- `mailer-staging-gateway` (`apps/gateway`) — every HTTP endpoint. Reads and writes D1. Sends `{ accountId }` to the queue.
-- `mailer-staging-pipeline` (`apps/pipeline`) — no HTTP endpoint. Runs the queue consumer, the Durable Object, the Workflow, and the cron. Calls Gmail and OpenRouter.
+- `mailer-staging-gateway` (`apps/gateway`) — every HTTP endpoint. Reads and writes D1. Sends `{ accountId, type }` to the queue.
+- `mailer-staging-pipeline` (`apps/pipeline`) — no HTTP endpoint. Runs the queue consumer, the Durable Object, the 3 Workflows, and the cron. Calls Gmail and OpenRouter.
 
-### 2.2 The 2 main flows
+The queue payload is `{ accountId, type }`. The type is `sync`, `backfill`, or `delete`. Where this file writes `{ accountId }`, the type is `sync`.
+
+### 2.2 The 3 main flows
 
 ```
 Connect
   Browser ─► web ─► gateway GET /v1/oauth/authorization ─► 302 to Google consent
   Google ─► Browser ─► web ─► gateway GET /v1/oauth/callback
       gateway: exchange code → create labels → users.watch → one D1 batch
+      ─► queue { accountId, type: backfill }
       ─► 302 to /connected, with the session cookie
+
+Backfill
+  queue ─► pipeline consumer ─► one MailBackfill Workflow per connection
+      messages.list (last 7 days, then days 8 to 30) → newest message of each thread
+      ─► one MailTriage Workflow per thread, with the source backfill
 
 New mail
   Gmail ─► Pub/Sub ─► gateway POST /v1/gmail/push ─► queue { accountId }
   queue ─► pipeline consumer ─► MailboxSync (history.list, one sync per account)
       ─► one MailTriage Workflow per new message
-          messages.get → OpenRouter → decide → threads.modify → activities row
+          messages.get → store the copy (R2 body, D1 row) → OpenRouter → decide
+          → threads.modify → activities row
 ```
 
 ### 2.3 Data
 
-D1 database `mailer-staging-db` holds 5 tables. Migration file: `infra/migrations/0001_phase1_initial.sql`. Section 7 gives each column, its type, and its constraints.
+D1 database `mailer-staging-db` holds 7 tables. Migration files: `infra/migrations/0001_phase1_initial.sql` for the first 5 tables, and `infra/migrations/0002_phase1_mail_store.sql` for `mail_keys` and `messages`. Section 7 gives each column, its type, and its constraints.
 
 ```
 accounts ─┬─< sessions        (many per account)
           ├── oauth_tokens    (zero or one per account)
           ├── mailboxes       (zero or one per account)
+          ├── mail_keys       (zero or one per account)
           └─< activities      (many per account)
-Every child row: ON DELETE CASCADE from accounts.id
+Every child row above: ON DELETE CASCADE from accounts.id
+
+messages                      (many per account, no foreign key)
+The delete job removes these rows after the account row is gone.
 ```
 
 - **`accounts`** — one row for each Google account.
@@ -106,6 +122,18 @@ Every child row: ON DELETE CASCADE from accounts.id
   - Columns: `account_id`, `gmail_message_id`, `gmail_thread_id`, `email_subject`, `category`, `model_confidence`, `mailer_action`, `model_id`, `prompt_tokens`, `completion_tokens`, `triage_duration_ms`, `created_at`
   - Written by: the Workflow (insert, ignore a duplicate).
   - Read by: the Workflow (duplicate check) and `GET /v1/mailboxes/me` (for `lastLabeledAt`).
+- **`mail_keys`** — the data key that encrypts the stored mail of one account.
+  - Key: `account_id`.
+  - Columns: `account_id`, `wrapped_data_key`, `wrap_nonce`, `created_at`
+  - Written by: `MailTriage` (insert, on the first stored message) and the gateway disconnect (cascade delete).
+  - Read by: `MailTriage`.
+- **`messages`** — one row for each email in the mail store.
+  - Key: `(account_id, gmail_message_id)`.
+  - Columns: `account_id`, `gmail_message_id`, `gmail_thread_id`, `sender`, `recipients`, `subject`, `sent_at`, `created_at`
+  - Written by: `MailTriage` (insert, ignore a duplicate) and `MailDelete` (delete).
+  - Read by: the hourly cron (to find rows of a deleted account). No Phase 1 screen reads it.
+
+R2 bucket `mailer-staging-mail` holds the body text of each stored email, as ciphertext. The object key is `mail/<accountId>/<gmailMessageId>`. Only the pipeline reads and writes it.
 
 KV namespace `mailer-staging-cache` holds one key shape: `access:<accountId>`, the Google access token, with a TTL. Only the pipeline reads and writes it.
 
@@ -123,7 +151,7 @@ All endpoints are on the gateway. The browser reaches them through the web Worke
   - Returns: `302` to Google.
 - **`GET /v1/oauth/callback`**
   - Caller: the browser, sent back by Google. Auth: the `state` query value must match the `mailer_oauth_state` cookie.
-  - Does: exchanges the code for tokens, checks the scope, creates the 5 Mailer labels, starts `users.watch`, and writes the account, the token, the mailbox, and a session in one D1 batch.
+  - Does: exchanges the code for tokens, checks the scope, creates the 5 Mailer labels, starts `users.watch`, and writes the account, the token, the mailbox, and a session in one D1 batch. It then sends the backfill event to the queue.
   - Returns:
     - `302` to `/connected`, with the `mailer_session` cookie
     - `302` to `/error?reason=<reason>` on a failure. The reason is one of `denied`, `state`, `exchange`, `scope`, or `watch`.
@@ -135,7 +163,7 @@ All endpoints are on the gateway. The browser reaches them through the web Worke
     - `401` with the code `unauthorized` when the session is missing or expired
 - **`DELETE /v1/mailboxes/me`**
   - Caller: the Disconnect button. Auth: the session cookie, and an `Origin` header equal to `APP_ORIGIN`.
-  - Does: stops the Gmail watch, revokes the Google token, deletes the account row and every child row, and clears the session cookie. A Google failure does not stop the delete.
+  - Does: stops the Gmail watch, revokes the Google token, deletes the account row and every child row, starts the delete of the mail store, and clears the session cookie. A Google failure does not stop the delete.
   - Returns: `204`, or `401`.
 - **`POST /v1/gmail/push`**
   - Caller: Google Pub/Sub. Auth: the Google OIDC bearer token, checked against `PUBSUB_AUDIENCE` and `PUBSUB_SERVICE_ACCOUNT`.
@@ -151,17 +179,24 @@ The web Worker has 3 screen routes, `/`, `/connected`, and `/error`. Section 11 
 These entry points have no URL. Section 9 gives the exact steps.
 
 - **Queue consumer** for `mailer-staging-mailbox-events`
-  - Input: `{ accountId }`
-  - Does: calls the `MailboxSync` object for that account. A failed sync retries 5 times, then goes to the dead-letter queue.
+  - Input: `{ accountId, type }`
+  - Does: for `sync`, calls the `MailboxSync` object for that account. For `backfill`, starts `MailBackfill`. For `delete`, starts `MailDelete`. A failed message retries 5 times, then goes to the dead-letter queue.
 - **Durable Object `MailboxSync`**, one for each account id
   - Does: reads new inbox history since the cursor, skips sent mail and drafts, starts one `MailTriage` for each new message (100 at most for each run), and moves the cursor forward.
   - Runs one sync at a time for each account.
 - **Workflow `MailTriage`**, one instance for each message
-  - Instance id: `<accountId>-<messageId>`. Params: `{ accountId, messageId, threadId }`.
-  - Does: loads the account, skips a duplicate, fetches the message, classifies it with OpenRouter, decides the action, labels the thread, and writes the activity row.
+  - Instance id: `<accountId>-<messageId>`. Params: `{ accountId, messageId, threadId, source }`.
+  - Does: loads the account, skips a duplicate, fetches the message, stores its encrypted copy, classifies it with OpenRouter, decides the action, labels the thread, and writes the activity row.
   - A model failure gives Needs Review.
+- **Workflow `MailBackfill`**, one instance for each connection
+  - Instance id: `<accountId>-backfill-<consentedAt>`. Params: `{ accountId }`.
+  - Does: lists the inbox messages of the last 7 days, then of days 8 to 30, and starts one `MailTriage` for the newest message of each thread.
+  - It reads no body, and it calls no model.
+- **Workflow `MailDelete`**, one instance for each delete event
+  - Params: `{ accountId }`.
+  - Does: deletes each R2 body of the account, then each `messages` row of the account.
 - **Cron `0 */6 * * *`** — renews each Gmail watch that expires within 36 hours. It never moves the cursor.
-- **Cron `0 * * * *`** — sends `{ accountId }` to the queue for each connected mailbox, so missed pushes get caught up.
+- **Cron `0 * * * *`** — sends `{ accountId }` to the queue for each connected mailbox, so missed pushes get caught up. It also sends a delete event for each account id in `messages` that has no `accounts` row.
 
 ### 2.6 Outbound calls
 
@@ -170,7 +205,7 @@ These entry points have no URL. Section 9 gives the exact steps.
   - Pipeline: refresh in the access-token function.
 - **Gmail API** — only through `packages/gmail`, and only the methods in `GMAIL_METHOD`.
   - Gateway: `labels.list`, `labels.create`, `watch`, and `stop`
-  - Pipeline: `history.list`, `getProfile`, `messages.get`, `threads.modify`, `labels.create`, and `watch`
+  - Pipeline: `history.list`, `getProfile`, `messages.get`, `messages.list`, `threads.modify`, `labels.create`, and `watch`
 - **Google public keys** — the gateway fetches them to check the push token.
 - **OpenRouter** `POST /chat/completions` — pipeline only.
 - Mailer never calls a Gmail send method or a Gmail delete method.
@@ -240,7 +275,7 @@ The architecture names `/v1/oauth/start` and `POST /v1/disconnect`. Both are ver
 - **By hand, once, with `cf`:** D1 `mailer-staging-db` and KV `mailer-staging-cache`. Their ids go into `cloudflare.config.ts`, so they must exist before the first deploy.
 - **By CI, on every run, with idempotent steps.** Each step creates the resource when it is missing, and does nothing when it exists.
   - The 2 queues, from `scripts/ensure-resources-staging.sh`
-  - The 3 Workers, the service binding, the Durable Object namespace, the Workflow, and the cron schedules, from `cf deploy`. A repeat deploy updates them in place.
+  - The 3 Workers, the service binding, the Durable Object namespace, the 3 Workflows, and the cron schedules, from `cf deploy`. A repeat deploy updates them in place.
 - **By hand, once, after the first deploy:** the Worker secrets. A secret is not a resource, and CI does not hold the values. This matches Nearcrawl and Closetza.
 - **CI change.** The migrate job in `deploy-staging.yml` stops creating D1. It finds the database by name and fails with a clear message when the database is missing.
 
@@ -271,10 +306,13 @@ Every Cloudflare and Google name uses `mailer-staging-<role>`. The environment s
   - Worker `mailer-staging-pipeline` — no public route. Created by `cf deploy`.
   - D1 database `mailer-staging-db` — created once by hand.
   - KV namespace `mailer-staging-cache` — holds the Gmail access tokens. Created once by hand.
-  - Queue `mailer-staging-mailbox-events` — carries `{ accountId }` from the gateway to the pipeline. Created by CI.
+  - Queue `mailer-staging-mailbox-events` — carries `{ accountId, type }` from the gateway to the pipeline. Created by CI.
   - Queue `mailer-staging-mailbox-events-dlq` — the dead-letter queue. No Worker consumes it. Created by CI.
   - Durable Object class `MailboxSync` — one object per account id. Created by `cf deploy` of the pipeline.
   - Workflow `mailer-staging-mail-triage`, class `MailTriage`. Created by `cf deploy` of the pipeline.
+  - Workflow `mailer-staging-mail-backfill`, class `MailBackfill`. Created by `cf deploy` of the pipeline.
+  - Workflow `mailer-staging-mail-delete`, class `MailDelete`. Created by `cf deploy` of the pipeline.
+  - R2 bucket `mailer-staging-mail` — holds the encrypted body text of the stored mail. Created by CI.
 - **OpenRouter** (created by hand)
   - API key `mailer-staging-openrouter`, with a credit limit
 - **Google Cloud** (one project, all created by hand)
@@ -305,10 +343,11 @@ Open the dashboard, then **My Profile**, **API Tokens**, and **Create Token**. C
 
 - **Account resources:** include only the Mailer account.
 - **Permissions, all at account level:**
-  - Workers Scripts: Edit — deploys the 3 Workers, the static assets, the service binding, the Durable Object, the Workflow, and the cron schedules
+  - Workers Scripts: Edit — deploys the 3 Workers, the static assets, the service binding, the Durable Object, the 3 Workflows, and the cron schedules
   - D1: Edit — applies the migrations
   - Workers KV Storage: Edit — validates the KV binding on deploy
   - Queues: Edit — creates the queues and the consumer
+  - Workers R2 Storage: Edit — creates the mail bucket and validates the R2 binding on deploy
   - Account Settings: Read — lets `cf` resolve the account
 - **Zone resources:** none. Staging uses `workers.dev`.
 - **TTL:** set an end date and write it down. An expired token fails every deploy.
@@ -391,12 +430,13 @@ cf workers secrets update GOOGLE_CLIENT_SECRET --worker mailer-staging-gateway -
 Repeat for each secret:
 
 - `mailer-staging-gateway`: `GOOGLE_CLIENT_SECRET` and `TOKEN_ENCRYPTION_KEY`
-- `mailer-staging-pipeline`: `GOOGLE_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`, and `OPENROUTER_API_KEY`
+- `mailer-staging-pipeline`: `GOOGLE_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`, `MAIL_ENCRYPTION_KEY`, and `OPENROUTER_API_KEY`
 - `mailer-staging-web`: none
 
 Notes:
 
 - Generate `TOKEN_ENCRYPTION_KEY` once with `openssl rand -base64 32`. Put the same value on both Workers. Store a copy in your password manager. If you lose the key, every stored token becomes unreadable, and each user must connect again.
+- Generate `MAIL_ENCRYPTION_KEY` with the same command, as a second value. Do not use the value of `TOKEN_ENCRYPTION_KEY`. It goes on the pipeline only, because the gateway reads no stored mail until Phase 6. Store a copy in your password manager. If you lose the key, every stored body becomes unreadable.
 - `OPENROUTER_API_KEY` goes on the pipeline only. The gateway never calls the model.
 - I read the `cf workers secrets update` help, but I did not run the command. When it fails, use the dashboard.
 
@@ -429,6 +469,9 @@ Notes:
   - `CACHE` — KV `mailer-staging-cache`, by id
   - `MAILBOX_SYNC` — Durable Object namespace for the class `MailboxSync`, with SQLite storage. The object keeps no state in storage.
   - `MAIL_TRIAGE` — the Workflow `mailer-staging-mail-triage`, class `MailTriage`
+  - `MAIL_BACKFILL` — the Workflow `mailer-staging-mail-backfill`, class `MailBackfill`
+  - `MAIL_DELETE` — the Workflow `mailer-staging-mail-delete`, class `MailDelete`
+  - `MAIL_BUCKET` — R2 `mailer-staging-mail`
 - **Triggers**
   - Queue consumer for `mailer-staging-mailbox-events`:
     - max batch size 10, max retries 5, retry delay 30 seconds
@@ -441,7 +484,7 @@ Notes:
   - `PUBSUB_TOPIC` — the renewal calls `users.watch` again
   - `OPENROUTER_BASE_URL` — `https://openrouter.ai/api/v1`
   - `OPENROUTER_MODEL` — the model id from Decision B
-- **Secrets:** `GOOGLE_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`, and `OPENROUTER_API_KEY`
+- **Secrets:** `GOOGLE_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`, `MAIL_ENCRYPTION_KEY`, and `OPENROUTER_API_KEY`
 - **Settings:** observability on. `workers.dev` off.
 
 ### `mailer-staging-web`
@@ -461,14 +504,16 @@ Notes:
 ## 7. Database schema
 
 - **Files**
-  - `infra/migrations/0001_phase1_initial.sql` holds the SQL.
+  - `infra/migrations/0001_phase1_initial.sql` holds the SQL of the first 5 tables.
+  - `infra/migrations/0002_phase1_mail_store.sql` holds the SQL of `mail_keys` and `messages`. Checkpoint 8 adds this file.
   - `packages/db` holds the Drizzle tables. Write both by hand so they match, column for column.
 - **Types**
   - Times are integers in epoch milliseconds (UTC).
   - Ids are text.
   - Booleans are integers `0` or `1`.
-- **Foreign keys.** Each foreign key is `ON DELETE CASCADE` on `accounts.id`. One `DELETE FROM accounts` removes every row of that account.
+- **Foreign keys.** Each foreign key is `ON DELETE CASCADE` on `accounts.id`. One `DELETE FROM accounts` removes every row of that account, except the `messages` rows.
   - D1 enforces foreign keys by default. Checkpoint 3 proves that the cascade works on staging.
+  - `messages.account_id` has no foreign key. `MailDelete` removes those rows after the account row is gone. Phase 6 needs the rows at that moment, to find the vectors of the account.
 - **No CHECK constraints for the closed sets.** SQLite cannot change a CHECK without a table rebuild. Zod validates the values at the boundary, from the `as const` objects in `packages/domain`.
 
 ### Table `accounts`
@@ -556,6 +601,47 @@ Notes:
 - The insert ignores a duplicate primary key. A repeat run does not fail.
 - The table never holds a body, a sender address, a snippet, or a header other than the subject.
 
+### Table `mail_keys`
+
+- `account_id` — text, primary key, foreign key
+- `wrapped_data_key` — blob, not null. The data key of the account after AES-256-GCM encryption under `MAIL_ENCRYPTION_KEY`.
+- `wrap_nonce` — blob, not null. The 12 random bytes that the unwrap needs.
+- `created_at` — integer, not null
+
+**Constraints:**
+
+- The data key is 32 random bytes from Web Crypto. D1 never holds it in plain form.
+- The associated data of the wrap is the account id, so a row copied to another account fails to unwrap.
+- The first stored message of an account creates the row. The insert ignores a duplicate key, and the caller then reads the row. So two close runs use one key.
+- Disconnect deletes this row through the cascade. Each stored body of the account is unreadable from that moment.
+
+### Table `messages`
+
+- `account_id` — text, not null. No foreign key.
+- `gmail_message_id` — text, not null
+- `gmail_thread_id` — text, not null
+- `sender` — text, not null. The `From` header.
+- `recipients` — text, not null. The `To` header and the `Cc` header, as one JSON object.
+- `subject` — text, not null. An empty subject is stored as an empty string.
+- `sent_at` — integer, not null. The `internalDate` of the message.
+- `created_at` — integer, not null
+- Primary key `(account_id, gmail_message_id)`
+
+**Constraints:**
+
+- The insert ignores a duplicate primary key.
+- The table never holds a body and never holds a snippet. The body is in R2, as ciphertext.
+- The row has no encryption from Mailer. Cloudflare encrypts D1 at rest.
+- Phase 6 adds the chunk count with a new migration.
+
+### R2 object `mail/<accountId>/<gmailMessageId>`
+
+- The bucket is `mailer-staging-mail`.
+- The object holds a 12-byte nonce, then the ciphertext of the body text.
+- The cipher is AES-256-GCM under the data key of the account, with a new random nonce for each write.
+- The associated data is the account id and the Gmail message id. A blob copied to another account, or to another message id, fails to decrypt.
+- The body text is the full text that step 4 of `MailTriage` reads. It is not cut to 8,000 characters. The object holds no attachment and no HTML.
+
 ---
 
 ## 8. Gateway: routes and behavior
@@ -617,11 +703,12 @@ The order matters. Every Google call comes before the first D1 write, so a failu
      - `label_id_by_name`
      - `status = connected`
    - Insert a `sessions` row.
-10. Set `mailer_session`, clear `mailer_oauth_state`, and redirect to `/connected`.
+10. Send `{ accountId, type: backfill }` to `MAILBOX_EVENTS`. When the send fails, log it and continue. The connection stays valid, and sync still labels new mail.
+11. Set `mailer_session`, clear `mailer_oauth_state`, and redirect to `/connected`.
 
 **Constraints:**
 
-- A reconnect replaces the token and the cursor. Activity rows stay.
+- A reconnect replaces the token and the cursor. Activity rows stay. The reconnect starts a new backfill, which classifies only the mail that has no activity row.
 - When step 9 fails after step 8, the watch is live with no row. The push handler ignores that unknown address, and the watch expires within 7 days. Accept this case and log it.
 - Never log the code, the tokens, or the id token.
 
@@ -643,8 +730,9 @@ The order matters. Every Google call comes before the first D1 write, so a failu
    - Call `users.stop`.
    - Revoke the refresh token at the Google revoke endpoint.
 3. A failure in step 2 does not stop the disconnect. Log it, then continue.
-4. Delete the `accounts` row. The cascade removes the token, the sessions, the mailbox, and the activities.
-5. Clear `mailer_session`. Return `204`.
+4. Delete the `accounts` row. The cascade removes the token, the sessions, the mailbox, the activities, and the `mail_keys` row. Each stored body is unreadable from this moment.
+5. Send `{ accountId, type: delete }` to `MAILBOX_EVENTS`. `MailDelete` removes the R2 bodies and the `messages` rows. When the send fails, log it and continue. The hourly cron sends the event again.
+6. Clear `mailer_session`. Return `204`.
 
 ### `POST /v1/gmail/push`
 
@@ -696,7 +784,7 @@ Google Pub/Sub ──POST /v1/gmail/push──► gateway
 
 ### Access token
 
-The Durable Object, the Workflow, and the cron all need an access token. They use one function in `apps/pipeline`:
+The Durable Object, the 3 Workflows, and the cron all need an access token. They use one function in `apps/pipeline`:
 
 1. Read `access:<accountId>` from KV.
 2. On a miss, decrypt the refresh token and call the Google token endpoint.
@@ -711,10 +799,17 @@ The Durable Object, the Workflow, and the cron all need an access token. They us
 
 - For each message, follow these steps:
   1. Parse the body with `parseMailboxEvent`.
-  2. Get the `MailboxSync` object by the name `accountId`.
-  3. Call its sync method.
+  2. For the type `sync`, get the `MailboxSync` object by the name `accountId`, and call its sync method.
+  3. For the type `backfill`, read `oauth_tokens.consented_at`, and create one `MailBackfill`:
+     - Instance id: `<accountId>-backfill-<consentedAt>`
+     - Params: `{ accountId }`
+     - An error that says the id exists means the backfill of this connection already started. Treat it as done.
+     - When the token row is missing, the account is gone. Acknowledge the message.
+  4. For the type `delete`, check the `accounts` table, and create one `MailDelete` with the params `{ accountId }`:
+     - When an `accounts` row exists for that id, acknowledge the message and start nothing. The store of a live account stays.
+     - Let Workflows choose the instance id. A second run for one account finds nothing and changes nothing.
 - A body that fails to parse: acknowledge it and log it. A retry cannot fix it.
-- A sync that throws: retry that message. After 5 retries, the message goes to the dead-letter queue.
+- A sync or a create that throws: retry that message. After 5 retries, the message goes to the dead-letter queue.
 
 ### Durable Object `MailboxSync`
 
@@ -755,6 +850,11 @@ Every step retries on its own: up to 3 times, with exponential backoff that star
    - Read the first `text/plain` part. When no plain part exists, take the first `text/html` part and strip the tags. Decode base64url as UTF-8. Ignore attachments.
    - Cut the text to `CLASSIFY_MAX_BODY_CHARS` (8,000).
    - Gmail `404` means the user deleted the message. End the instance.
+   - **Store the copy** before the step returns (US-8.9):
+     - Load the data key: read the `mail_keys` row, and unwrap the key with `MAIL_ENCRYPTION_KEY`. When the row is missing, create a data key, wrap it, insert the row, and read the row again.
+     - Encrypt the full body text, and write it to R2 at `mail/<accountId>/<gmailMessageId>`.
+     - Insert the `messages` row, and ignore a duplicate key.
+     - The R2 write and the row write share this step, because the full body and the plain data key must stay out of the step output. A retry repeats both writes with the same result.
    - The step returns the subject, the sender, and the cut text. Workflows keeps a step's output in its state, so the body stays in the instance state until Workflows deletes the instance. Set the Workflow retention to the shortest value that still allows the id guard, and record the value in `architecture.md`.
 5. **Classify.** Call OpenRouter with `OPENROUTER_MODEL` and the request rules in Decision B.
    - The system instruction says:
@@ -779,6 +879,55 @@ Every step retries on its own: up to 3 times, with exponential backoff that star
    - When a label id in `label_id_by_name` no longer exists (Gmail `404` or `400`), the user deleted the label. Create it again, update `label_id_by_name`, and retry.
 8. **Write the activity row.** Insert it and ignore a duplicate key. `triage_duration_ms` = now minus the instance start time.
 
+**The source `backfill`.** `MailBackfill` starts `MailTriage` with `source = backfill`. `MailboxSync` starts it with `source = sync`. A backfill run differs in two places:
+
+- In step 4, when the `labelIds` of the message hold one of the 5 Phase 1 label ids, end the instance. Store no copy and write no activity row. A newer message already gave the thread its label, and that label stays.
+- In step 6, the result is `needs_review` or `labeled` in every phase. From Phase 2, a backfill run creates no draft and archives nothing.
+
+### Workflow `MailBackfill`
+
+One instance labels the inbox mail from before one connection. It lists message ids, and `MailTriage` does the rest. It reads no subject and no body, and it calls no model.
+
+Every step retries on its own, with the same rule as `MailTriage`. A Gmail `429` or `5xx` throws, and the step retries.
+
+1. **Load the mailbox.** When the row is missing, or the status is `disconnected`, end the instance. Repeat this check before each page.
+2. **Get an access token.**
+3. **List one page.** Call `users.messages.list` with these parameters:
+   - `q` = `in:inbox -in:sent -in:drafts newer_than:7d`, with the day count from `BACKFILL_FIRST_DAYS`
+   - `maxResults` = `BACKFILL_PAGE_SIZE` (100)
+   - `pageToken` from the previous page
+   - Gmail leaves Spam and Trash out of the list.
+4. **Keep one message for each thread.** Keep the first listed message of a thread. Drop each later message of a thread that this instance already took. The first listed message is the newest one.
+5. **Start the triage.** Start one `MailTriage` per kept message with the Workflow batch create:
+   - Instance id: `<accountId>-<messageId>`, the same id as for sync
+   - Params: `{ accountId, messageId, threadId, source: backfill }`
+   - An error that says the id exists means sync already started that message. Treat it as done.
+6. **Wait.** Sleep for `BACKFILL_PAGE_PAUSE_SECONDS` (60) with the Workflow sleep. Then go to step 3 for the next page.
+7. **Read the second window.** After the last page, repeat steps 3 to 6 with `q` = `in:inbox -in:sent -in:drafts newer_than:30d older_than:7d`. The day counts come from `BACKFILL_TOTAL_DAYS` and `BACKFILL_FIRST_DAYS`.
+
+**Constraints:**
+
+- Sync does not wait for the backfill. A new message gets its label while the backfill runs.
+- The thread list of step 4 covers both windows. A thread that the first window took gets no second run from the second window.
+- The step output holds message ids and thread ids only.
+- The backfill writes no D1 row. The activity rows come from `MailTriage`.
+- Disconnect needs no cancel call. Step 1 ends the backfill, and step 1 of `MailTriage` ends each run that already started.
+
+### Workflow `MailDelete`
+
+One instance deletes the mail store of one account after disconnect. The data key is already gone, so each body is unreadable before this Workflow starts.
+
+1. **Delete the bodies.** List at most 1,000 R2 objects with the prefix `mail/<accountId>/`, and delete them in one call. Repeat until the list is empty.
+2. **Delete the rows.** Delete each `messages` row of the account in one statement.
+3. **Check.** List the prefix again. When an object exists, go to step 1. A triage run that ended late can write one more object.
+
+**Constraints:**
+
+- Every step retries on its own, with the same rule as `MailTriage`.
+- The Workflow reads no body and holds no key.
+- The prefix holds the account id, so the Workflow cannot reach the mail of another account.
+- A `messages` row that a late triage run writes after step 3 has no `accounts` row. The hourly cron finds it and starts `MailDelete` again.
+
 ### Cron
 
 - **`0 */6 * * *` — watch renewal.** For each `connected` mailbox where `gmail_watch_expires_at` is within `WATCH_RENEW_WINDOW_HOURS` (36) of now:
@@ -787,6 +936,7 @@ Every step retries on its own: up to 3 times, with exponential backoff that star
   3. Update `gmail_watch_expires_at` only.
   4. A failure for one mailbox does not stop the others.
 - **`0 * * * *` — catch-up.** For each `connected` mailbox, send `{ accountId }` to the queue. The Durable Object does the rest. A current cursor starts no Workflow.
+- **`0 * * * *` — store cleanup.** The same schedule reads each account id in `messages` that has no `accounts` row, in one query. For each id, it sends `{ accountId, type: delete }` to the queue. This covers a failed send in disconnect, and a row from a late triage run.
 
 ---
 
@@ -795,16 +945,22 @@ Every step retries on its own: up to 3 times, with exponential backoff that star
 - **`packages/domain`** (`mailer-domain`)
   - Already has `CATEGORY`, `LABEL`, `SUGGESTED_ACTION`, `ACTIVITY_ACTION`, `CLASSIFY_MIN_CONFIDENCE`, the email triage schema, and the queue payload.
   - Add `MAILBOX_STATUS`.
+  - Add `MAILBOX_EVENT_TYPE` (`sync`, `backfill`, `delete`) to the queue payload, and `TRIAGE_SOURCE` (`sync`, `backfill`).
   - Add these product thresholds:
     - `GOOGLE_TESTING_TOKEN_DAYS` (7)
     - `WATCH_RENEW_WINDOW_HOURS` (36)
     - `SYNC_MAX_MESSAGES` (100)
+    - `BACKFILL_FIRST_DAYS` (7)
+    - `BACKFILL_TOTAL_DAYS` (30)
+    - `BACKFILL_PAGE_SIZE` (100)
+    - `BACKFILL_PAGE_PAUSE_SECONDS` (60)
     - `CLASSIFY_MAX_BODY_CHARS` (8,000)
     - `ACTIVITY_SUBJECT_MAX_CHARS` (255)
   - Add the mapping from each action and category to its label name.
 - **`packages/gmail`**
-  - Add one function for each `GMAIL_METHOD` that Phase 1 calls: `watch`, `stop`, `getProfile`, `history.list`, `messages.get`, `labels.list`, `labels.create`, and `threads.modify`. Each function takes an access token and plain data, and calls `fetch`.
-  - Add the Google OAuth calls in a separate `as const` object: code exchange, refresh, and revoke. They are not Gmail methods. The allowlist test stays the same.
+  - Add one function for each `GMAIL_METHOD` that Phase 1 calls: `watch`, `stop`, `getProfile`, `history.list`, `messages.get`, `messages.list`, `labels.list`, `labels.create`, and `threads.modify`. Each function takes an access token and plain data, and calls `fetch`.
+  - Add `users.messages.list` to `GMAIL_METHOD` and to the expected list of the allowlist test. The backfill is its one caller in Phase 1.
+  - Add the Google OAuth calls in a separate `as const` object: code exchange, refresh, and revoke. They are not Gmail methods, so they stay out of the allowlist.
   - Keep `drafts.create` unused until Phase 2.
   - No send function. No delete function.
   - Map Gmail errors to named error types: not found, rate limited, unauthorized, and invalid grant. The caller decides the retry.
@@ -813,11 +969,16 @@ Every step retries on its own: up to 3 times, with exponential backoff that star
   - The key comes from base64 `TOKEN_ENCRYPTION_KEY` and must be 32 bytes. Fail loudly when it is not.
   - The associated data is the account id.
   - Decrypt fails with a named error when the account id or the key does not match.
+- **Mail cipher** (`apps/pipeline/src/triage-mail/`)
+  - The data key wrap and the body cipher live in the job folder, because `MailTriage` is the one caller in Phase 1. Phase 6 moves them to a shared package when the gateway reads a body.
+  - The cipher is AES-256-GCM in Web Crypto, the same as in `packages/tokens`.
+  - `MAIL_ENCRYPTION_KEY` must be 32 bytes after base64 decoding. Fail loudly when it is not.
 - **`packages/db`**
-  - The Drizzle tables match `0001_phase1_initial.sql`.
-  - One repository for each table, named for the table: `accounts`, `sessions`, `oauthTokens`, `mailboxes`, and `activities`.
+  - The Drizzle tables match `0001_phase1_initial.sql` and `0002_phase1_mail_store.sql`.
+  - One repository for each table, named for the table: `accounts`, `sessions`, `oauthTokens`, `mailboxes`, `activities`, `mailKeys`, and `messages`.
   - Method names follow the rule: Get, Find, List, and one named action per write. Examples: `advanceHistoryCursor`, `resetHistoryCursor`, `markDisconnected`, `updateWatchExpiry`.
   - No `update(row)`.
+  - The application code for `mail_keys` and `messages` comes after CI applies `0002_phase1_mail_store.sql` on staging. This is the migration rule in `mailer.mdc`.
   - Add `drizzle-orm` as a dependency. After a new SQL file is added, `pnpm db:sync` runs `drizzle-kit generate --custom` and records the file. The pre-commit hook runs that command. Do not run `drizzle-kit generate` without `--custom`. Do not use `drizzle-kit push`.
 
 ---
@@ -828,6 +989,8 @@ Route paths stay in `ROUTE` in `apps/web/src/routes.ts`. Each screen loads `GET 
 
 - **Home `/`**
   - Shows the 4 actions: label new mail, optional draft later, the activity list later, and disconnect. (US-1.1)
+  - States that Mailer also labels the inbox mail of the last 30 days. (US-1.1)
+  - States that Mailer keeps an encrypted copy of the text of each email that it labels, and deletes that copy on disconnect. (US-1.1)
   - States that Mailer does not send mail.
   - Shows the warning that the Google permission includes send, above the Connect button. (US-1.2)
   - Connect is a plain link to `/v1/oauth/authorization`.
@@ -866,6 +1029,7 @@ detect-changes → test → migrate (when SQL changed)
 - **New ensure-resources job.** It runs `scripts/ensure-resources-staging.sh`, which works like the Closetza `ensure-queues-staging.sh`:
   - List the queues. Create `mailer-staging-mailbox-events` and `mailer-staging-mailbox-events-dlq` when missing. Skip a queue that exists.
   - It uses `cf queues list` and `cf queues create --queue-name`.
+  - From checkpoint 8, it also creates the R2 bucket `mailer-staging-mail` when the bucket is missing. I did not read the `cf` help for the R2 commands. Find them with `cf cli search r2`.
   - It runs on every push, after the test job. It does not wait for the migrate job, because the migrate job is skipped when no SQL changed.
   - Both deploy jobs of the Workers need it. The pipeline deploy fails when its queue is missing.
 - **Deploy gateway job.** No change to the command. It still runs `cf deploy` in `apps/gateway`. Remove `apps/web/` from its change pattern.
@@ -970,9 +1134,54 @@ Each checkpoint is one pull request to `develop`. Its staging check must pass be
   - Open the staging URL. The home screen shows the connect-again notice.
   - Connect again. Labels resume for new mail. The earlier activity rows still exist.
 
+### Checkpoint 8: Store the copy
+
+This checkpoint is two pull requests, because of the migration rule. The first holds the SQL file only. The second holds the code, after CI applies the SQL on staging.
+
+- **Build**
+  - `0002_phase1_mail_store.sql`, then the Drizzle tables and the 2 repositories
+  - The R2 bucket in `scripts/ensure-resources-staging.sh`, the `MAIL_BUCKET` binding, and the R2 permission on the CI token
+  - `MAIL_ENCRYPTION_KEY` on the pipeline, and its check in the env schema
+  - The data key, the body cipher, and the store part of step 4 in `MailTriage`
+  - The copy sentence on the home screen
+- **Staging check**
+  - Send a message to the test inbox. The D1 console shows one `messages` row and one `mail_keys` row for the account.
+  - The R2 dashboard shows the object `mail/<accountId>/<gmailMessageId>`. Download it. The content is not readable text.
+  - Send a second message. `mail_keys` still has one row for the account.
+  - Reply from the test inbox. The reply has no `messages` row and no object.
+  - The pipeline logs hold no body text and no key.
+  - A unit test proves that a body decrypts under the same account id and message id, and fails under another account id.
+
+### Checkpoint 9: Delete the copy
+
+- **Build**
+  - The type `delete` in the queue payload, and step 5 of disconnect
+  - `MailDelete`, the `MAIL_DELETE` binding, and the store cleanup in the hourly cron
+- **Staging check**
+  - Disconnect. The `mail_keys` row is gone at once.
+  - After `MailDelete` ends, the bucket has no object under `mail/<accountId>/`, and `messages` has no row for that account.
+  - The store of a second connected test account stays complete.
+
+### Checkpoint 10: Backfill
+
+- **Build**
+  - `users.messages.list` in `packages/gmail`, and the allowlist change
+  - The type `backfill` in the queue payload, and step 10 of the callback
+  - `MailBackfill`, and the source `backfill` in `MailTriage`
+  - The 30-day sentence on the home screen
+- **Staging check**
+  - Use a test account that holds inbox mail from the last 7 days, from days 8 to 30, and from before that. Connect.
+  - Each inbox thread of the last 30 days gets one Mailer label. The pipeline logs show the first window before the second window.
+  - A thread that has only older mail, an archived thread, a sent message, and a draft have no Mailer label.
+  - A thread with 3 inbox messages has one activity row, and that row names the newest message. This proves the list order of Gmail.
+  - Each labeled thread of the backfill has one `messages` row and one R2 object, for that same message.
+  - Send a message while the backfill runs. The thread gets its label within 30 seconds.
+  - Disconnect while a backfill runs. No new label appears after that.
+  - Connect again. The OpenRouter **Activity** page shows no new request for a thread that already has a label.
+
 ### Phase 1 release check
 
-Run the 4 steps in [delivery.md](delivery.md), Phase 1 release check, on staging. Phase 1 is done when all 4 pass after checkpoint 7.
+Run the 6 steps in [delivery.md](delivery.md), Phase 1 release check, on staging. Phase 1 is done when all 6 pass after checkpoint 10.
 
 ---
 
@@ -983,9 +1192,15 @@ These rules hold in every checkpoint. A change that breaks one is a defect.
 - **Mail and privacy**
   - Mailer never sends mail, never deletes mail, and never removes `INBOX` in Phase 1.
   - Mailer touches only the 5 `Mailer/*` labels. It never changes a label that the user owns.
-  - Mail from before connect stays unchanged. The start line is the `historyId` of the first watch.
+  - The backfill labels the inbox mail of the 30 days before connect. Mail older than that stays unchanged.
+  - The backfill adds a label only. It never replaces a Mailer label that a thread already has.
+  - The start line of sync is the `historyId` of the first watch.
   - Mail that the user sends, and every draft, gets no label.
   - D1, KV, and the logs never hold a mail body. The activity row holds the subject only.
+  - Mailer stores a copy of each email that it classifies, and of no other email. The copy is a `messages` row and one R2 object.
+  - R2 holds a body only as AES-256-GCM ciphertext under the data key of its account. No store holds a plain body or a plain data key.
+  - Disconnect deletes the data key first, then each body and each row of the account.
+  - In Phase 1, the copy of an email that the user deletes in Gmail stays until disconnect. No Phase 1 screen and no Phase 1 job reads a stored body. The first step of Phase 2 removes the copy of a deleted email.
   - The logs never hold a token, an authorization header, a code, an id token, a subject, or a Gmail address. A log line names the account id and the message id.
 - **Correctness**
   - One Gmail message gets at most one Mailer decision. The Workflow instance id and the activity key both enforce it.
@@ -993,9 +1208,10 @@ These rules hold in every checkpoint. A change that breaks one is a defect.
   - The history cursor only moves forward, except for the `404` reset.
   - A watch renewal never moves the cursor.
   - One mailbox runs one history sync at a time.
+  - One connection runs one backfill.
 - **Accounts**
   - One Google account maps to one Mailer account. A reconnect keeps the account id and the activity rows.
-  - Disconnect deletes every row of the account, even when the Google calls fail.
+  - Disconnect deletes every row and every stored body of the account, even when the Google calls fail.
   - A revoked grant marks the mailbox `disconnected`, deletes the token, and stops all work for that account until the user connects again.
 - **Model**
   - The model output never decides an action on its own. The rules in PRD section 6.2 run after the model returns.
@@ -1025,3 +1241,13 @@ These rules hold in every checkpoint. A change that breaks one is a defect.
 - **Testing mode.** Weekly reconnects are a real cost for test users. Verification needs a third-party security assessment. A Google Workspace internal app avoids both.
 - **Push volume.** Each label write by Mailer causes one extra push and one empty sync. That is fine for test users. Measure it before more users join.
 - **Cron renewal check.** Section 13, checkpoint 6, explains why the renewal needs about 5.5 days to observe on staging.
+- **Backfill cost.** The backfill makes one model call for each inbox thread of the last 30 days. The thread count of a real inbox has no measurement yet. The OpenRouter credit limit is the cap. When the credit ends, each remaining thread gets Needs Review.
+- **Backfill rate.** The backfill starts 100 triage runs each 60 seconds. The rate limit of the OpenRouter key is not confirmed. A `429` that outlasts the retries gives Needs Review. Checkpoint 10 proves the two values.
+- **Backfill list order.** The backfill takes the first listed message of a thread as the newest. The Gmail sync guide names the first message of the list as the most recent. The reference page of `users.messages.list` does not state the order for a `q` search. Checkpoint 10 proves it.
+- **Backfill label race.** A new message and the backfill can reach one thread in the same seconds. Then the label of the older message can win. The next message on that thread corrects it.
+- **Backfill step count.** Each page uses three Workflow steps. Confirm the step limit of one instance against the page count of a large inbox.
+- **Stale copy.** In Phase 1, the store does not follow a delete in Gmail. The copy of a deleted email stays until disconnect. The first step of Phase 2 is the sync that removes it.
+- **No reader in Phase 1.** No Phase 1 feature reads the store. The store adds one R2 write and two D1 statements to each triage run. Measure the label time again at checkpoint 8.
+- **Loss of `MAIL_ENCRYPTION_KEY`.** Every stored body becomes unreadable. Mailer can read the mail from Gmail again, so the loss removes the copy and no mail.
+- **Security assessment.** Mailer holds mail text on its servers from Phase 1. Google's verification of a restricted scope asks for a third-party assessment in that case.
+- **D1 size.** A D1 database stops at 10 GB. The `messages` rows hold headers only, and the bodies are in R2.
